@@ -27,28 +27,34 @@ class MiniQwen(nn.Module):
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.head_dim = head_dim
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, kv_caches=None, start_pos=0):
         batch, seq_len = input_ids.shape
 
-        x = self.embed_tokens(input_ids)  # word IDs -> 896-number fingerprints
+        x = self.embed_tokens(input_ids)
 
-        cos, sin = build_rope_cache(
-            self.head_dim, max_seq_len=seq_len,
+        # Build RoPE angles for the CORRECT positions.
+        # If we're generating word 6 alone, its position is 5 (0-indexed), not 0.
+        cos_full, sin_full = build_rope_cache(
+            self.head_dim, max_seq_len=start_pos + seq_len,
             theta=self.config.rope_parameters["rope_theta"],
             device=input_ids.device,
         )
+        cos = cos_full[start_pos:start_pos + seq_len]
+        sin = sin_full[start_pos:start_pos + seq_len]
 
-        for layer in self.layers:
-            x = layer(x, cos, sin)
+        if kv_caches is None:
+            kv_caches = [None] * len(self.layers)
+
+        new_caches = []
+        for layer, layer_cache in zip(self.layers, kv_caches):
+            x, updated_cache = layer(x, cos, sin, layer_cache)
+            new_caches.append(updated_cache)
 
         x = self.norm(x)
-
-        # Output head: reuse the embedding table (tied weights), transposed
         logits = x @ self.embed_tokens.weight.T
-        return logits
+        return logits, new_caches
 
     def load_pretrained_weights(self, hf_model):
-        """Copy every real, trained weight from the official model into ours."""
         self.embed_tokens.weight.data = hf_model.model.embed_tokens.weight.data.clone()
         self.norm.weight.data = hf_model.model.norm.weight.data.clone()
 

@@ -12,17 +12,15 @@ class TransformerLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps)
         self.mlp = SwiGLU(hidden_size, intermediate_size)
 
-    def forward(self, x, cos, sin):
-        # Attention block, with residual connection
+    def forward(self, x, cos, sin, kv_cache=None):
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x, cos, sin)
+        x, new_cache = self.self_attn(x, cos, sin, kv_cache)
         x = residual + x
 
-        # Feed-forward block, with residual connection
         residual = x
         x = self.post_attention_layernorm(x)
         x = self.mlp(x)
         x = residual + x
 
-        return x
+        return x, new_cache
