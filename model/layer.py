@@ -24,3 +24,16 @@ class TransformerLayer(nn.Module):
         x = residual + x
 
         return x, new_cache
+
+    def forward_paged(self, x, cos, sin, paged_cache, layer_idx, page_table, start_pos):
+        residual = x
+        x = self.input_layernorm(x)
+        x = self.self_attn.forward_paged(x, cos, sin, paged_cache, layer_idx, page_table, start_pos)
+        x = residual + x
+
+        residual = x
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+        x = residual + x
+
+        return x

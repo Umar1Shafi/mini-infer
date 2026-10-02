@@ -75,3 +75,29 @@ class MiniQwen(nn.Module):
             layer.mlp.gate_proj.weight.data = real_layer.mlp.gate_proj.weight.data.clone()
             layer.mlp.up_proj.weight.data = real_layer.mlp.up_proj.weight.data.clone()
             layer.mlp.down_proj.weight.data = real_layer.mlp.down_proj.weight.data.clone()
+
+    def forward_paged(self, input_ids, paged_cache, page_table, start_pos):
+        """
+        Generate logits using the paged KV cache instead of a contiguous one.
+        Assumes batch=1 (one sequence at a time; concurrency comes from giving
+        different sequences different page_tables, handled by the caller).
+        """
+        batch, seq_len = input_ids.shape
+        assert batch == 1, "forward_paged expects one sequence at a time"
+
+        x = self.embed_tokens(input_ids)
+
+        cos_full, sin_full = build_rope_cache(
+            self.head_dim, max_seq_len=start_pos + seq_len,
+            theta=self.config.rope_parameters["rope_theta"],
+            device=input_ids.device,
+        )
+        cos = cos_full[start_pos:start_pos + seq_len]
+        sin = sin_full[start_pos:start_pos + seq_len]
+
+        for layer_idx, layer in enumerate(self.layers):
+            x = layer.forward_paged(x, cos, sin, paged_cache, layer_idx, page_table, start_pos)
+
+        x = self.norm(x)
+        logits = x @ self.embed_tokens.weight.T
+        return logits
