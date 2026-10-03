@@ -37,3 +37,16 @@ class TransformerLayer(nn.Module):
         x = residual + x
 
         return x
+    
+    def forward_paged_batch(self, x_batch, paged_cache, layer_idx, page_tables, start_positions, rope_theta):
+        residual = x_batch
+        x = self.input_layernorm(x_batch)
+        x = self.self_attn.forward_paged_batch(x, paged_cache, layer_idx, page_tables, start_positions, rope_theta)
+        x = residual + x
+
+        residual = x
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+        x = residual + x
+
+        return x

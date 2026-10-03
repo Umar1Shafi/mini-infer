@@ -101,3 +101,21 @@ class MiniQwen(nn.Module):
         x = self.norm(x)
         logits = x @ self.embed_tokens.weight.T
         return logits
+
+    def forward_paged_batch(self, input_ids_batch, paged_cache, page_tables, start_positions):
+        """
+        Batched DECODE step for many sequences at once (one new token each).
+        input_ids_batch: (batch_size, 1)
+        """
+        batch_size = input_ids_batch.shape[0]
+        assert input_ids_batch.shape[1] == 1
+
+        x = self.embed_tokens(input_ids_batch)  # (batch_size, 1, hidden_size)
+        rope_theta = self.config.rope_parameters["rope_theta"]
+
+        for layer_idx, layer in enumerate(self.layers):
+            x = layer.forward_paged_batch(x, paged_cache, layer_idx, page_tables, start_positions, rope_theta)
+
+        x = self.norm(x)
+        logits = x @ self.embed_tokens.weight.T
+        return logits  # (batch_size, 1, vocab_size)
