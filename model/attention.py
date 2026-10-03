@@ -1,3 +1,4 @@
+from model.rope import apply_rope, apply_rope_batched
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -98,4 +99,73 @@ class GroupedQueryAttention(nn.Module):
         out = weights @ v_expanded
 
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        return self.o_proj(out)
+    
+    def forward_paged_batch(self, x_batch, paged_cache, layer_idx, page_tables, start_positions, rope_theta):
+        """
+        Batched DECODE step: one new token per sequence, sequences at different
+        cache lengths. Pads shorter sequences' K/V to the batch max, masks the
+        padding with -inf so it contributes nothing to softmax.
+
+        x_batch: (batch_size, 1, hidden_size)
+        page_tables: list of page tables, one per sequence, len == batch_size
+        start_positions: list of ints (this new token's position per sequence)
+        """
+        from model.rope import build_rope_cache  # local import to avoid circularity concerns
+
+        batch_size = x_batch.shape[0]
+        assert x_batch.shape[1] == 1, "forward_paged_batch handles one new token per sequence (decode only)"
+        assert len(page_tables) == batch_size == len(start_positions)
+
+        q = self.q_proj(x_batch).view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x_batch).view(batch_size, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x_batch).view(batch_size, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Per-sequence RoPE angles: each sequence is at its own position
+        max_pos = max(start_positions) + 1
+        cos_full, sin_full = build_rope_cache(self.head_dim, max_seq_len=max_pos, theta=rope_theta, device=x_batch.device)
+        positions_tensor = torch.tensor(start_positions, device=x_batch.device)
+        cos = cos_full[positions_tensor].unsqueeze(1)  # (batch, 1, head_dim/2)
+        sin = sin_full[positions_tensor].unsqueeze(1)
+
+        q = apply_rope_batched(q, cos, sin)
+        k = apply_rope_batched(k, cos, sin)
+
+        # Write this step's new token into each sequence's own pages, then
+        # read back each sequence's FULL history (different lengths, hence the loop)
+        k_list, v_list, lengths = [], [], []
+        for i in range(batch_size):
+            k_i = k[i]  # (num_kv_heads, 1, head_dim)
+            v_i = v[i]
+            paged_cache.write(layer_idx, page_tables[i], start_positions[i], k_i, v_i)
+            total_len = start_positions[i] + 1
+            k_full, v_full = paged_cache.read(layer_idx, page_tables[i], total_len)
+            k_list.append(k_full)
+            v_list.append(v_full)
+            lengths.append(total_len)
+
+        # Pad every sequence's history to the batch's longest, and mark which
+        # positions are REAL vs. padding (padding gets masked to -inf before softmax)
+        max_len = max(lengths)
+        k_padded = torch.zeros(batch_size, self.num_kv_heads, max_len, self.head_dim, dtype=x_batch.dtype, device=x_batch.device)
+        v_padded = torch.zeros_like(k_padded)
+        valid_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=x_batch.device)
+        for i in range(batch_size):
+            L = lengths[i]
+            k_padded[i, :, :L, :] = k_list[i]
+            v_padded[i, :, :L, :] = v_list[i]
+            valid_mask[i, :L] = True
+
+        k_expanded = k_padded.repeat_interleave(self.num_groups, dim=1)
+        v_expanded = v_padded.repeat_interleave(self.num_groups, dim=1)
+
+        scores = (q @ k_expanded.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (batch, heads, 1, max_len)
+
+        pad_mask = (~valid_mask).unsqueeze(1).unsqueeze(1)  # (batch, 1, 1, max_len)
+        scores = scores.masked_fill(pad_mask, float("-inf"))
+
+        weights = F.softmax(scores, dim=-1)
+        out = weights @ v_expanded  # (batch, heads, 1, head_dim)
+
+        out = out.transpose(1, 2).contiguous().view(batch_size, 1, -1)
         return self.o_proj(out)
