@@ -8,6 +8,7 @@ class PageAllocator:
         self.page_size = page_size
         self.free_pages = list(range(num_pages))  # all pages start free
         self.sequence_tables = {}  # seq_id -> ordered list of page indices it owns
+        self.ref_counts = [0] * num_pages  # NEW: how many sequences currently reference each physical page
 
     def allocate_sequence(self, seq_id):
         """Register a new sequence with no pages yet."""
@@ -39,6 +40,7 @@ class PageAllocator:
                     f"{self.num_free_pages()} pages free)"
                 )
             page = self.free_pages.pop()
+            self.ref_counts[page] = 1  # NEW: this sequence is the page's sole owner so far
             current_pages.append(page)
             newly_allocated.append(page)
 
@@ -48,10 +50,29 @@ class PageAllocator:
         """Return the ordered list of physical page indices owned by this sequence."""
         return self.sequence_tables[seq_id]
 
+    def attach_shared_page(self, seq_id, physical_page):
+        """
+        NEW: attach an already-computed physical page (owned by some other
+        sequence too) to seq_id's page table, without allocating a new page.
+        Increments the page's reference count instead.
+        """
+        if seq_id not in self.sequence_tables:
+            raise ValueError(f"Sequence {seq_id} not found, call allocate_sequence first")
+        self.sequence_tables[seq_id].append(physical_page)
+        self.ref_counts[physical_page] += 1
+
     def free_sequence(self, seq_id):
-        """Release all pages owned by seq_id back to the free pool."""
+        """
+        Release seq_id's ownership of its pages. A page only returns to the
+        free pool once NO sequence references it anymore (ref count hits 0).
+        """
         pages = self.sequence_tables.pop(seq_id)
-        self.free_pages.extend(pages)
+        for page in pages:
+            self.ref_counts[page] -= 1
+            if self.ref_counts[page] == 0:
+                self.free_pages.append(page)
+            elif self.ref_counts[page] < 0:
+                raise RuntimeError(f"Page {page} reference count went negative, double-free?")
 
     def token_slot(self, position):
         """

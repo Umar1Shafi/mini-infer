@@ -88,6 +88,96 @@ def test_token_slot_mapping():
     assert alloc.token_slot(37) == (2, 5)    # matches the worked example above
     print("test_token_slot_mapping: PASS")
 
+def test_shared_page_ref_counting():
+    """Two sequences sharing one physical page: the page must survive until
+    BOTH release it, not just the first one."""
+    allocator = PageAllocator(num_pages=4, page_size=16)
+
+    allocator.allocate_sequence("seq-A")
+    allocator.ensure_capacity("seq-A", num_tokens=16)  # allocates exactly 1 page
+    shared_page = allocator.get_page_table("seq-A")[0]
+    assert allocator.ref_counts[shared_page] == 1
+
+    allocator.allocate_sequence("seq-B")
+    allocator.attach_shared_page("seq-B", shared_page)
+    assert allocator.ref_counts[shared_page] == 2, "ref count should be 2 after sharing"
+    assert allocator.get_page_table("seq-B") == [shared_page]
+
+    # Freeing seq-A must NOT return the page to the free pool - seq-B still needs it
+    allocator.free_sequence("seq-A")
+    assert allocator.ref_counts[shared_page] == 1
+    assert shared_page not in allocator.free_pages, "page freed too early while still shared"
+
+    # Now freeing seq-B (the last owner) SHOULD return it
+    allocator.free_sequence("seq-B")
+    assert allocator.ref_counts[shared_page] == 0
+    assert shared_page in allocator.free_pages, "page should return to free pool once unreferenced"
+
+    print("test_shared_page_ref_counting: PASS")
+
+
+def test_three_way_sharing():
+    """Three sequences sharing the same page: must take exactly three frees
+    to return it, in any order."""
+    allocator = PageAllocator(num_pages=4, page_size=16)
+
+    allocator.allocate_sequence("seq-A")
+    allocator.ensure_capacity("seq-A", num_tokens=16)
+    shared_page = allocator.get_page_table("seq-A")[0]
+
+    allocator.allocate_sequence("seq-B")
+    allocator.attach_shared_page("seq-B", shared_page)
+    allocator.allocate_sequence("seq-C")
+    allocator.attach_shared_page("seq-C", shared_page)
+    assert allocator.ref_counts[shared_page] == 3
+
+    allocator.free_sequence("seq-B")
+    assert shared_page not in allocator.free_pages
+    allocator.free_sequence("seq-A")
+    assert shared_page not in allocator.free_pages
+    allocator.free_sequence("seq-C")
+    assert shared_page in allocator.free_pages
+
+    print("test_three_way_sharing: PASS")
+
+
+def test_attach_shared_page_requires_registered_sequence():
+    """attach_shared_page on an unregistered seq_id must fail loudly, the
+    same way ensure_capacity already does."""
+    allocator = PageAllocator(num_pages=4, page_size=16)
+    try:
+        allocator.attach_shared_page("ghost-seq", 0)
+        assert False, "expected a ValueError for an unregistered sequence"
+    except ValueError:
+        pass
+
+    print("test_attach_shared_page_requires_registered_sequence: PASS")
+
+
+def test_private_pages_unaffected_by_sharing():
+    """A sequence with a mix of shared + private pages must free correctly:
+    the shared page waits for the other owner, the private page does not."""
+    allocator = PageAllocator(num_pages=4, page_size=16)
+
+    allocator.allocate_sequence("seq-A")
+    allocator.ensure_capacity("seq-A", num_tokens=16)
+    shared_page = allocator.get_page_table("seq-A")[0]
+
+    allocator.allocate_sequence("seq-B")
+    allocator.attach_shared_page("seq-B", shared_page)       # shared page
+    allocator.ensure_capacity("seq-B", num_tokens=32)          # + 1 private page
+    private_page = allocator.get_page_table("seq-B")[1]
+    assert allocator.ref_counts[private_page] == 1
+
+    allocator.free_sequence("seq-B")
+    assert private_page in allocator.free_pages, "private page should free immediately"
+    assert shared_page not in allocator.free_pages, "shared page still owned by seq-A"
+
+    allocator.free_sequence("seq-A")
+    assert shared_page in allocator.free_pages
+
+    print("test_private_pages_unaffected_by_sharing: PASS")
+
 if __name__ == "__main__":
     test_basic_allocation()
     test_ceiling_division_exact_boundary()
@@ -96,4 +186,8 @@ if __name__ == "__main__":
     test_free_and_reuse()
     test_multiple_concurrent_sequences()
     test_token_slot_mapping()
+    test_shared_page_ref_counting()
+    test_three_way_sharing()
+    test_attach_shared_page_requires_registered_sequence()
+    test_private_pages_unaffected_by_sharing()
     print("\nAll page allocator tests passed.")
