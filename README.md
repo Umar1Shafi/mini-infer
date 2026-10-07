@@ -79,6 +79,18 @@ Hand-written GPU kernels (not `torch` ops), compiled with Triton, each verified 
 
 The RMSNorm and paged-attention speedups differ by an order of magnitude for a reason: RMSNorm is a tiny per-row operation, so its runtime is dominated by fixed kernel-launch/memory overhead that both versions pay roughly equally, leaving a modest win. Paged-attention's win is much larger because `forward_paged`'s PyTorch path pays a real, growing cost — a Python-level loop in `PagedKVCache.read()` gathering across every page (126 of them here) into one contiguous tensor before attention can even start. The Triton kernel reads directly from scattered pages inside the GPU kernel itself, eliminating that gather step entirely — this is the actual mechanism, and the actual payoff, behind vLLM's real PagedAttention kernel.
 
+### 6. Prefix caching
+Lets requests that share an identical prompt prefix (the common case: a fixed system prompt in front of every user message) reuse the same physical pages instead of each one computing and storing its own copy. Only whole, fully-filled pages are ever shared — a page still being written into can't be handed to anyone else.
+
+**Built and verified in layers:**
+1. Reference-counted page ownership — extended `PageAllocator` so a physical page can be owned by more than one sequence at once; a page only returns to the free pool once every owner has released it. 11 unit tests (7 original + 4 new: shared-page ref counting, three-way sharing, attach-to-unregistered-sequence guard, mixed shared/private pages freeing independently)
+2. `PrefixCache` — exact, page-aligned prefix matching: given a new request's prompt, finds the longest run of already-cached full pages it can reuse. 6 unit tests (empty cache, exact match, partial final page never shared, divergence stops the match at the right page, no-match case, longer prompt gets credit only for its shared portion)
+3. End-to-end integration — two sequences sharing an 8-token prefix: the second reuses the first's pages and writes only its own new tokens, reads back a reconstruction that's bit-identical (0.0 diff) to the original, and — the critical safety check — freeing the *first* sequence does not corrupt or prematurely free the pages the *second* is still using
+4. Memory impact: 200 requests sharing a 300-token system prompt (18 full pages), page size 16:
+   - Without prefix caching: 4,738 total page-allocations
+   - With prefix caching: 1,110 unique physical pages actually in use
+   - **4.27x fewer physical pages needed**, from 3,582 shared-page reuse events (199 requests × 18 shared pages — exactly matching the hand-derived math)
+
 ## Tech stack
 Python, PyTorch, Triton (custom GPU kernels), Qwen2.5-0.5B weights via `transformers`/`safetensors` (loading only, not inference), WSL2 + CUDA.
 
@@ -96,10 +108,11 @@ model/
   feedforward.py               SwiGLU feed-forward block, verified
   layer.py                    One transformer layer (contiguous, paged, batched-paged)
   full_model.py                Full 24-layer model (contiguous, paged, batched-paged)
-  page_allocator.py            Page allocation and tracking
+  page_allocator.py            Page allocation and tracking, with reference counting for shared pages
   paged_cache.py                Paged KV storage (write/read)
   scheduler.py                  Request lifecycle and continuous-batching scheduler
   paged_attention_triton.py     Triton paged-attention decode kernels (single-page and multi-page/online-softmax), verified
+  prefix_cache.py                Exact, page-aligned prefix matching for shared prompt prefixes, verified
 
 test_rmsnorm.py                         RMSNorm correctness
 test_rope.py                             RoPE correctness
@@ -119,12 +132,15 @@ test_triton_rmsnorm.py                   Triton RMSNorm vs. project RMSNorm and 
 test_online_softmax_math.py              Online-softmax algorithm proof (pure PyTorch, pre-Triton)
 test_triton_paged_attention.py           Triton paged-attention kernel, single-page case
 test_triton_paged_attention_multipage.py Triton paged-attention kernel, multi-page/online-softmax case
+test_prefix_cache.py                     PrefixCache unit tests (matching, divergence, partial pages)
+test_prefix_cache_integration.py         Prefix caching end to end: sharing, correctness, safe freeing
 
 bench_gpu.py                     GPU timing + memory-per-token benchmark
 bench_paged_memory.py            Paged vs. naive memory, concurrent request capacity
 bench_continuous_batching.py     Throughput: sequential vs. continuous batching
 bench_triton_rmsnorm.py          Triton vs. PyTorch RMSNorm speed
 bench_triton_paged_attention.py  Triton vs. PyTorch paged-attention decode speed
+bench_prefix_cache.py            Prefix caching memory savings, shared system prompt scenario
 check_match.py                    float32 vs. bfloat16 cache divergence check
 inspect_config.py                 Prints the model's config for reference
 ```
@@ -151,6 +167,8 @@ python3 test_triton_rmsnorm.py
 python3 test_online_softmax_math.py
 python3 test_triton_paged_attention.py
 python3 test_triton_paged_attention_multipage.py
+python3 test_prefix_cache.py
+python3 test_prefix_cache_integration.py
 ```
 
 ## Roadmap
@@ -159,5 +177,6 @@ python3 test_triton_paged_attention_multipage.py
 - [x] Paged KV cache
 - [x] Continuous batching
 - [x] Custom Triton attention kernel (RMSNorm + single-page and multi-page paged-attention decode)
-- [ ] Prefix caching or speculative decoding
+- [x] Prefix caching
+- [ ] Speculative decoding
 - [ ] Final throughput/latency benchmarks vs. Hugging Face `generate`
