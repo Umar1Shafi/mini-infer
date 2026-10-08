@@ -4,6 +4,8 @@ A language model inference engine built from scratch in PyTorch, no `transformer
 
 Base model: Qwen2.5-0.5B. Built and benchmarked on a 4GB RTX 3050 laptop GPU.
 
+**Headline result: 3.55x faster than plain Hugging Face `generate()`** on identical hardware, identical weights, greedy decoding on both sides — 8 concurrent requests, continuous batching (`max_batch_size=8`) vs. running them one at a time. See [§7](#7-final-benchmark-vs-hugging-face-generate) for the full comparison.
+
 ## Why this project exists
 
 Most ML portfolios stop at "I can call a model." This project goes one level deeper: it rebuilds the systems that make serving a language model fast and memory-efficient, the same ideas used in production engines like vLLM, at small scale and with full correctness proofs at every step.
@@ -91,6 +93,20 @@ Lets requests that share an identical prompt prefix (the common case: a fixed sy
    - With prefix caching: 1,110 unique physical pages actually in use
    - **4.27x fewer physical pages needed**, from 3,582 shared-page reuse events (199 requests × 18 shared pages — exactly matching the hand-derived math)
 
+### 7. Final benchmark vs. Hugging Face `generate()`
+The number everything above was built toward: mini-infer's full serving stack (paged KV cache + continuous-batching scheduler) measured against plain `model.generate()` — no custom code at all — on the same GPU, same weights, same prompts, greedy decoding on both sides.
+
+**8 requests, 30 new tokens each, RTX 3050, bfloat16:**
+
+| Serving method | Time | Throughput | Speedup |
+|---|---|---|---|
+| Hugging Face `generate()` (sequential) | 11.80s | 20.3 tok/s | 1.00x |
+| mini-infer, max_batch_size=2 | 9.36s | 25.6 tok/s | 1.26x |
+| mini-infer, max_batch_size=4 | 5.76s | 41.7 tok/s | 2.05x |
+| mini-infer, max_batch_size=8 | 3.32s | 72.2 tok/s | **3.55x** |
+
+This is the full stack working together, not any one piece in isolation: the paged cache is what makes it safe to grow the batch size without reserving worst-case memory per request, and the scheduler is what turns that into fewer, larger, better-utilized GPU calls instead of one small call per request.
+
 ## Tech stack
 Python, PyTorch, Triton (custom GPU kernels), Qwen2.5-0.5B weights via `transformers`/`safetensors` (loading only, not inference), WSL2 + CUDA.
 
@@ -141,6 +157,7 @@ bench_continuous_batching.py     Throughput: sequential vs. continuous batching
 bench_triton_rmsnorm.py          Triton vs. PyTorch RMSNorm speed
 bench_triton_paged_attention.py  Triton vs. PyTorch paged-attention decode speed
 bench_prefix_cache.py            Prefix caching memory savings, shared system prompt scenario
+bench_vs_huggingface.py          Final benchmark: mini-infer vs. plain HF generate()
 check_match.py                    float32 vs. bfloat16 cache divergence check
 inspect_config.py                 Prints the model's config for reference
 ```
@@ -178,5 +195,5 @@ python3 test_prefix_cache_integration.py
 - [x] Continuous batching
 - [x] Custom Triton attention kernel (RMSNorm + single-page and multi-page paged-attention decode)
 - [x] Prefix caching
+- [x] Final throughput/latency benchmark vs. Hugging Face `generate` (**3.55x**)
 - [ ] Speculative decoding
-- [ ] Final throughput/latency benchmarks vs. Hugging Face `generate`
